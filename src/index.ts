@@ -16,7 +16,7 @@ import {
 } from './config.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import { TelegramChannel } from './channels/telegram.js';
-import { ensureContainerRuntimeRunning } from './container-runtime.js';
+import { cleanupOrphans, ensureContainerRuntimeRunning } from './container-runtime.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -196,7 +196,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           activityText = `💭 ${a.text}`;
           break;
         case 'tool_use':
-          activityText = a.input ? `🔧 ${a.tool}\n${a.input}` : `🔧 ${a.tool}`;
+          activityText = a.input ? `🔧 ${a.tool}: ${a.input}` : `🔧 ${a.tool}`;
           break;
         case 'text':
           activityText = `💬 ${a.text}`;
@@ -440,6 +440,35 @@ function recoverPendingMessages(): void {
 
 function ensureContainerSystemRunning(): void {
   ensureContainerRuntimeRunning();
+  cleanupOrphans();
+}
+
+/**
+ * Clear stale IPC input files left over from a previous service run.
+ * Any .json or _close files in data/ipc/*\/input/ belong to containers
+ * that are no longer running. Removing them prevents new containers from
+ * processing stale messages — the DB cursor + recoverPendingMessages()
+ * handles re-delivery from the database instead.
+ */
+function clearStaleIpcInputs(): void {
+  const ipcRoot = path.join(DATA_DIR, 'ipc');
+  if (!fs.existsSync(ipcRoot)) return;
+  let cleared = 0;
+  for (const groupFolder of fs.readdirSync(ipcRoot)) {
+    const inputDir = path.join(ipcRoot, groupFolder, 'input');
+    if (!fs.existsSync(inputDir)) continue;
+    for (const file of fs.readdirSync(inputDir)) {
+      if (file.endsWith('.json') || file === '_close') {
+        try {
+          fs.rmSync(path.join(inputDir, file));
+          cleared++;
+        } catch { /* ignore */ }
+      }
+    }
+  }
+  if (cleared > 0) {
+    logger.info({ cleared }, 'Cleared stale IPC input files from previous run');
+  }
 }
 
 async function main(): Promise<void> {
@@ -556,6 +585,7 @@ async function main(): Promise<void> {
     writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
   });
   queue.setProcessMessagesFn(processGroupMessages);
+  clearStaleIpcInputs();
   recoverPendingMessages();
   startMessageLoop();
 }

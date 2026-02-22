@@ -481,14 +481,8 @@ async function runQuery(
       if (event.type === 'content_block_start' && event.content_block) {
         const idx = event.index ?? 0;
         blockAccum.set(idx, { type: event.content_block.type, name: event.content_block.name, text: '' });
-        // Emit tool_use immediately — name is known at start
-        if (event.content_block.type === 'tool_use' && event.content_block.name) {
-          writeOutput({
-            status: 'success',
-            result: null,
-            activity: { type: 'tool_use', tool: event.content_block.name },
-          });
-        }
+        // Don't emit tool_use here — wait for content_block_stop when full input is known.
+        // This avoids a duplicate notification (start with no input, then stop with input).
       }
 
       if (event.type === 'content_block_delta' && event.delta) {
@@ -515,10 +509,19 @@ async function runQuery(
             activity: { type: 'thinking', text: accum.text.slice(0, 2000) },
           });
         } else if (accum?.type === 'tool_use' && accum.text) {
+          // Extract a brief, human-readable description from the tool input JSON.
+          // Avoids sending raw JSON to users — just the most relevant field.
+          let brief: string | undefined;
+          try {
+            const inp = JSON.parse(accum.text) as Record<string, unknown>;
+            const s = (v: unknown) => typeof v === 'string' ? v.slice(0, 120) : undefined;
+            brief = s(inp.url) ?? s(inp.command) ?? s(inp.file_path) ?? s(inp.path)
+              ?? s(inp.query) ?? s(inp.pattern) ?? s(inp.prompt);
+          } catch { /* not valid JSON, skip */ }
           writeOutput({
             status: 'success',
             result: null,
-            activity: { type: 'tool_use', tool: accum.name || 'unknown', input: accum.text.slice(0, 300) },
+            activity: { type: 'tool_use', tool: accum.name || 'unknown', input: brief },
           });
         } else if (accum?.type === 'text' && accum.text && blockAccum.size > 0) {
           // Mid-turn text (tool calls follow in this message) — emit as activity
