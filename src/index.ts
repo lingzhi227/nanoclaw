@@ -461,7 +461,23 @@ async function main(): Promise<void> {
   }
 
   if (TELEGRAM_BOT_TOKEN) {
-    const telegram = new TelegramChannel(TELEGRAM_BOT_TOKEN, channelOpts);
+    const telegram = new TelegramChannel(TELEGRAM_BOT_TOKEN, {
+      ...channelOpts,
+      onAutoRegisterTopic: (topicJid, parentJid, threadId) => {
+        if (registeredGroups[topicJid]) return;
+        const parent = registeredGroups[parentJid];
+        if (!parent) return;
+        registerGroup(topicJid, {
+          name: `${parent.name} (topic ${threadId})`,
+          folder: `${parent.folder}-t${threadId}`,
+          trigger: parent.trigger,
+          added_at: new Date().toISOString(),
+          containerConfig: parent.containerConfig,
+          requiresTrigger: false,
+        });
+        queue.enqueueMessageCheck(topicJid);
+      },
+    });
     channels.push(telegram);
     await telegram.connect();
   }
