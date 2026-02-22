@@ -5,6 +5,7 @@ import path from 'path';
 import {
   ASSISTANT_NAME,
   DATA_DIR,
+  GROUPS_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
@@ -487,6 +488,15 @@ async function main(): Promise<void> {
           requiresTrigger: false,
         });
         queue.enqueueMessageCheck(topicJid);
+      },
+      onMediaFile: async (chatJid, buffer, ext) => {
+        const group = registeredGroups[chatJid];
+        if (!group) throw new Error(`No group for ${chatJid}`);
+        const uploadsDir = path.join(GROUPS_DIR, group.folder, 'uploads');
+        fs.mkdirSync(uploadsDir, { recursive: true });
+        const filename = `photo_${Date.now()}.${ext}`;
+        fs.writeFileSync(path.join(uploadsDir, filename), buffer);
+        return `/workspace/group/uploads/${filename}`;
       },
     });
     channels.push(telegram);

@@ -23,6 +23,8 @@ export interface TelegramChannelOpts {
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
   onAutoRegisterTopic?: (topicJid: string, parentJid: string, threadId: number) => void;
+  /** Download an image and save it to the group folder. Returns the container-side path. */
+  onMediaFile?: (chatJid: string, buffer: Buffer, ext: string) => Promise<string>;
 }
 
 export class TelegramChannel implements Channel {
@@ -175,7 +177,53 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
+    this.bot.on('message:photo', async (ctx) => {
+      // Try to download and save the image for vision analysis
+      if (this.opts.onMediaFile) {
+        const threadId = ctx.message?.message_thread_id as number | undefined;
+        const chatJid = buildTgJid(ctx.chat.id, threadId);
+        let group = this.opts.registeredGroups()[chatJid];
+        if (!group && threadId !== undefined && this.opts.onAutoRegisterTopic) {
+          const parentJid = `tg:${ctx.chat.id}`;
+          if (this.opts.registeredGroups()[parentJid]) {
+            this.opts.onAutoRegisterTopic(chatJid, parentJid, threadId);
+            group = this.opts.registeredGroups()[chatJid];
+          }
+        }
+        if (group) {
+          const largest = ctx.message.photo[ctx.message.photo.length - 1];
+          const caption = ctx.message.caption ? `\nCaption: ${ctx.message.caption}` : '';
+          const timestamp = new Date(ctx.message.date * 1000).toISOString();
+          const senderName = ctx.from?.first_name || ctx.from?.username || ctx.from?.id?.toString() || 'Unknown';
+          let content: string;
+          try {
+            const file = await this.bot!.api.getFile(largest.file_id);
+            const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+            const resp = await fetch(url);
+            const buffer = Buffer.from(await resp.arrayBuffer());
+            const ext = file.file_path?.split('.').pop() || 'jpg';
+            const containerPath = await this.opts.onMediaFile(chatJid, buffer, ext);
+            content = `[Photo: ${containerPath}]${caption}`;
+            logger.info({ chatJid, containerPath }, 'Telegram photo saved for vision');
+          } catch (err) {
+            logger.warn({ chatJid, err }, 'Failed to download Telegram photo, using placeholder');
+            content = `[Photo]${caption}`;
+          }
+          this.opts.onChatMetadata(chatJid, timestamp);
+          this.opts.onMessage(chatJid, {
+            id: ctx.message.message_id.toString(),
+            chat_jid: chatJid,
+            sender: ctx.from?.id?.toString() || '',
+            sender_name: senderName,
+            content,
+            timestamp,
+            is_from_me: false,
+          });
+          return;
+        }
+      }
+      storeNonText(ctx, '[Photo]');
+    });
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
     this.bot.on('message:voice', (ctx) =>
       storeNonText(ctx, '[Voice message]'),
