@@ -170,11 +170,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   await channel.setTyping?.(chatJid, true);
-  const typingInterval = setInterval(() => {
+  let typingInterval: ReturnType<typeof setInterval> | null = setInterval(() => {
     channel.setTyping?.(chatJid, true).catch(() => {});
   }, 4000);
   let hadError = false;
   let outputSentToUser = false;
+
+  const stopTyping = () => {
+    if (typingInterval) {
+      clearInterval(typingInterval);
+      typingInterval = null;
+      channel.setTyping?.(chatJid, false).catch(() => {});
+    }
+  };
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Forward activity events to user as real-time status
@@ -198,7 +206,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           activityText = `📋 ${a.text}`;
           break;
       }
-      if (activityText) await channel.sendMessage(chatJid, activityText);
+      if (activityText) {
+        stopTyping();
+        await channel.sendMessage(chatJid, activityText);
+      }
       return;
     }
 
@@ -209,6 +220,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
+        stopTyping();
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
       }
@@ -221,8 +233,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
-  clearInterval(typingInterval);
-  await channel.setTyping?.(chatJid, false);
+  stopTyping();
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
