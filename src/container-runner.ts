@@ -51,9 +51,10 @@ export interface ContainerOutput {
   newSessionId?: string;
   error?: string;
   activity?: {
-    type: 'tool_use';
-    tool: string;
-    input: string;
+    type: 'thinking' | 'tool_use' | 'text' | 'tool_result' | 'tool_use_summary';
+    tool?: string;
+    input?: string;
+    text?: string;
   };
 }
 

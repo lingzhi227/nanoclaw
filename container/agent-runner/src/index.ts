@@ -35,9 +35,10 @@ interface ContainerOutput {
   newSessionId?: string;
   error?: string;
   activity?: {
-    type: 'tool_use';
-    tool: string;
-    input: string;
+    type: 'thinking' | 'tool_use' | 'text' | 'tool_result' | 'tool_use_summary';
+    tool?: string;
+    input?: string;
+    text?: string;
   };
 }
 
@@ -395,6 +396,9 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
 
+  // Accumulator for streaming content blocks (thinking text, tool input JSON)
+  const blockAccum = new Map<number, { type: string; name?: string; text: string }>();
+
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
@@ -453,6 +457,8 @@ async function runQuery(
           },
         },
       },
+      includePartialMessages: true,
+      maxThinkingTokens: 10000,
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook()] }],
         PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
@@ -467,21 +473,83 @@ async function runQuery(
       lastAssistantUuid = (message as { uuid: string }).uuid;
     }
 
-    // Emit tool activity events so the host can show real-time progress
-    if (message.type === 'assistant' && 'message' in message) {
-      const assistantMsg = message as { message: { content: Array<{ type: string; name?: string; input?: unknown }> } };
-      const toolBlocks = assistantMsg.message?.content?.filter(b => b.type === 'tool_use') || [];
-      for (const block of toolBlocks) {
+    // --- Real-time streaming via partial messages (content_block_start/delta/stop) ---
+    if ((message as { type: string }).type === 'stream_event' && 'event' in message) {
+      const event = (message as { event: { type: string; index?: number; content_block?: { type: string; name?: string }; delta?: { type: string; thinking?: string; partial_json?: string; text?: string } } }).event;
+
+      if (event.type === 'content_block_start' && event.content_block) {
+        const idx = event.index ?? 0;
+        blockAccum.set(idx, { type: event.content_block.type, name: event.content_block.name, text: '' });
+        // Emit tool_use immediately — name is known at start
+        if (event.content_block.type === 'tool_use' && event.content_block.name) {
+          writeOutput({
+            status: 'success',
+            result: null,
+            activity: { type: 'tool_use', tool: event.content_block.name },
+          });
+        }
+      }
+
+      if (event.type === 'content_block_delta' && event.delta) {
+        const idx = event.index ?? 0;
+        const accum = blockAccum.get(idx);
+        if (accum) {
+          if (event.delta.type === 'thinking_delta' && event.delta.thinking) {
+            accum.text += event.delta.thinking;
+          } else if (event.delta.type === 'input_json_delta' && event.delta.partial_json) {
+            accum.text += event.delta.partial_json;
+          } else if (event.delta.type === 'text_delta' && event.delta.text) {
+            accum.text += event.delta.text;
+          }
+        }
+      }
+
+      if (event.type === 'content_block_stop') {
+        const idx = event.index ?? 0;
+        const accum = blockAccum.get(idx);
+        if (accum?.type === 'thinking' && accum.text) {
+          writeOutput({
+            status: 'success',
+            result: null,
+            activity: { type: 'thinking', text: accum.text.slice(0, 2000) },
+          });
+        } else if (accum?.type === 'tool_use' && accum.text) {
+          writeOutput({
+            status: 'success',
+            result: null,
+            activity: { type: 'tool_use', tool: accum.name || 'unknown', input: accum.text.slice(0, 300) },
+          });
+        } else if (accum?.type === 'text' && accum.text && blockAccum.size > 0) {
+          // Mid-turn text (tool calls follow in this message) — emit as activity
+          // Don't emit final-answer text; that arrives via 'result'
+        }
+        blockAccum.delete(idx);
+      }
+    }
+
+    // --- Tool result feedback (user messages with tool_use_result = tool outputs) ---
+    if (message.type === 'user') {
+      const userMsg = message as { tool_use_result?: unknown };
+      if (userMsg.tool_use_result !== undefined) {
+        const preview = typeof userMsg.tool_use_result === 'string'
+          ? userMsg.tool_use_result.slice(0, 500)
+          : JSON.stringify(userMsg.tool_use_result).slice(0, 500);
         writeOutput({
           status: 'success',
           result: null,
-          activity: {
-            type: 'tool_use',
-            tool: block.name!,
-            input: JSON.stringify(block.input).slice(0, 300),
-          },
+          activity: { type: 'tool_result', text: preview },
         });
       }
+    }
+
+    // --- Non-streaming event types ---
+    if ((message as { type: string }).type === 'tool_use_summary') {
+      const ts = message as { summary: string };
+      writeOutput({
+        status: 'success',
+        result: null,
+        activity: { type: 'tool_use_summary', text: ts.summary.slice(0, 1000) },
+      });
     }
 
     if (message.type === 'system' && message.subtype === 'init') {

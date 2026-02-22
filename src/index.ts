@@ -177,10 +177,28 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let outputSentToUser = false;
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Forward activity events (tool use) to user as real-time status
+    // Forward activity events to user as real-time status
     if (result.activity) {
-      const activityText = `🔧 ${result.activity.tool}\n${result.activity.input}`;
-      await channel.sendMessage(chatJid, activityText);
+      const a = result.activity;
+      let activityText: string | null = null;
+      switch (a.type) {
+        case 'thinking':
+          activityText = `💭 ${a.text}`;
+          break;
+        case 'tool_use':
+          activityText = a.input ? `🔧 ${a.tool}\n${a.input}` : `🔧 ${a.tool}`;
+          break;
+        case 'text':
+          activityText = `💬 ${a.text}`;
+          break;
+        case 'tool_result':
+          activityText = `✅ ${a.text}`;
+          break;
+        case 'tool_use_summary':
+          activityText = `📋 ${a.text}`;
+          break;
+      }
+      if (activityText) await channel.sendMessage(chatJid, activityText);
       return;
     }
 
