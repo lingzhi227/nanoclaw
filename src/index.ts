@@ -1,5 +1,6 @@
 import { execSync } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -497,6 +498,32 @@ async function main(): Promise<void> {
         const filename = `photo_${Date.now()}.${ext}`;
         fs.writeFileSync(path.join(uploadsDir, filename), buffer);
         return `/workspace/group/uploads/${filename}`;
+      },
+      getSkills: () => {
+        const skillsDirs = [
+          path.join(process.cwd(), 'container', 'skills'),
+          path.join(os.homedir(), '.claude', 'skills'),
+        ];
+        const seen = new Set<string>();
+        const result: Array<{ name: string; description: string }> = [];
+        for (const skillsDir of skillsDirs) {
+          if (!fs.existsSync(skillsDir)) continue;
+          for (const entry of fs.readdirSync(skillsDir, { withFileTypes: true })) {
+            // Use statSync to follow symlinks (global skills are symlinked)
+            const entryPath = path.join(skillsDir, entry.name);
+            try { if (!fs.statSync(entryPath).isDirectory()) continue; } catch { continue; }
+            const skillFile = path.join(skillsDir, entry.name, 'SKILL.md');
+            if (!fs.existsSync(skillFile)) continue;
+            const content = fs.readFileSync(skillFile, 'utf8');
+            const nameMatch = content.match(/^name:\s*(.+)$/m);
+            const descMatch = content.match(/^description:\s*(.+)$/m);
+            const name = nameMatch?.[1]?.trim() ?? entry.name;
+            if (seen.has(name)) continue;
+            seen.add(name);
+            result.push({ name, description: descMatch?.[1]?.trim() ?? '' });
+          }
+        }
+        return result.sort((a, b) => a.name.localeCompare(b.name));
       },
     });
     channels.push(telegram);

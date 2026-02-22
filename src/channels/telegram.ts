@@ -25,7 +25,12 @@ export interface TelegramChannelOpts {
   onAutoRegisterTopic?: (topicJid: string, parentJid: string, threadId: number) => void;
   /** Download an image and save it to the group folder. Returns the container-side path. */
   onMediaFile?: (chatJid: string, buffer: Buffer, ext: string) => Promise<string>;
+  /** Returns list of available skills for the /skills command. */
+  getSkills?: () => Array<{ name: string; description: string }>;
 }
+
+/** Bot commands handled natively — these are NOT forwarded to the agent. */
+const BUILT_IN_COMMANDS = new Set(['chatid', 'ping', 'skills']);
 
 export class TelegramChannel implements Channel {
   name = 'telegram';
@@ -64,9 +69,31 @@ export class TelegramChannel implements Channel {
       ctx.reply(`${ASSISTANT_NAME} is online.`);
     });
 
+    // Command to list available skills
+    this.bot.command('skills', async (ctx) => {
+      const skills = this.opts.getSkills?.() ?? [];
+      if (skills.length === 0) {
+        await ctx.reply('No skills available.');
+        return;
+      }
+      const lines = skills.map((s) => `/${s.name} — ${s.description}`);
+      const header = `Available skills (${skills.length}):\n\n`;
+      const MAX = 4096;
+      let chunk = header;
+      for (const line of lines) {
+        if ((chunk + line + '\n').length > MAX) {
+          await ctx.reply(chunk.trimEnd());
+          chunk = '';
+        }
+        chunk += line + '\n';
+      }
+      if (chunk.trim()) await ctx.reply(chunk.trimEnd());
+    });
+
     this.bot.on('message:text', async (ctx) => {
-      // Skip commands
-      if (ctx.message.text.startsWith('/')) return;
+      // Skip built-in bot commands — skill commands (/skill-name args) are forwarded to the agent
+      const cmdMatch = ctx.message.text.match(/^\/(\w+)/);
+      if (cmdMatch && BUILT_IN_COMMANDS.has(cmdMatch[1].toLowerCase())) return;
 
       const threadId = ctx.message.message_thread_id;
       const chatJid = buildTgJid(ctx.chat.id, threadId);

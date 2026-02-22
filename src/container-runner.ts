@@ -132,15 +132,25 @@ function buildVolumeMounts(
     }, null, 2) + '\n');
   }
 
-  // Sync skills from container/skills/ into each group's .claude/skills/
-  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
+  // Sync skills into each group's .claude/skills/:
+  //   1. container/skills/    — project-level skills (checked into repo)
+  //   2. ~/.claude/skills/    — host-level global skills (user's personal skills)
+  // Host skills take precedence (copied second, overwrite project-level duplicates).
   const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
+  const skillsSources = [
+    path.join(process.cwd(), 'container', 'skills'),
+    path.join(getHomeDir(), '.claude', 'skills'),
+  ];
+  for (const skillsSrc of skillsSources) {
+    if (!fs.existsSync(skillsSrc)) continue;
     for (const skillDir of fs.readdirSync(skillsSrc)) {
       const srcDir = path.join(skillsSrc, skillDir);
-      if (!fs.statSync(srcDir).isDirectory()) continue;
+      try { if (!fs.statSync(srcDir).isDirectory()) continue; } catch { continue; }
       const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
+      // Remove existing destination (may be a broken symlink from a previous sync)
+      // before copying, to ensure we write real files (not symlinks pointing into the host).
+      fs.rmSync(dstDir, { recursive: true, force: true });
+      fs.cpSync(srcDir, dstDir, { recursive: true, dereference: true });
     }
   }
   mounts.push({
