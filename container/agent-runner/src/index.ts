@@ -34,6 +34,11 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  activity?: {
+    type: 'tool_use';
+    tool: string;
+    input: string;
+  };
 }
 
 interface SessionEntry {
@@ -460,6 +465,23 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+    }
+
+    // Emit tool activity events so the host can show real-time progress
+    if (message.type === 'assistant' && 'message' in message) {
+      const assistantMsg = message as { message: { content: Array<{ type: string; name?: string; input?: unknown }> } };
+      const toolBlocks = assistantMsg.message?.content?.filter(b => b.type === 'tool_use') || [];
+      for (const block of toolBlocks) {
+        writeOutput({
+          status: 'success',
+          result: null,
+          activity: {
+            type: 'tool_use',
+            tool: block.name!,
+            input: JSON.stringify(block.input).slice(0, 300),
+          },
+        });
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
