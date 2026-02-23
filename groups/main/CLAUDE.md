@@ -1,6 +1,6 @@
-# Andy
+# Claw
 
-You are Andy, a personal assistant. You help with tasks, answer questions, and can schedule reminders.
+You are Claw, a personal assistant. You help with tasks, answer questions, and can schedule reminders.
 
 ## What You Can Do
 
@@ -67,11 +67,34 @@ Main has access to the entire project:
 |----------------|-----------|--------|
 | `/workspace/project` | Project root | read-write |
 | `/workspace/group` | `groups/main/` | read-write |
+| `/workspace/extra/remote-access` | SSH config & keys for Perlmutter | read-only |
+| `/workspace/extra/lingzhi` | Home directory (`/Users/lingzhi`) | read-write |
+| `/workspace/extra/Code` | `~/Code` (projects) | read-write |
 
 Key paths inside the container:
 - `/workspace/project/store/messages.db` - SQLite database
 - `/workspace/project/store/messages.db` (registered_groups table) - Group config
 - `/workspace/project/groups/` - All group folders
+
+## SSH Access to Perlmutter (NERSC)
+
+SSH config and keys for Perlmutter are mounted at `/workspace/extra/remote-access/`.
+
+To connect:
+```bash
+ssh -F /workspace/extra/remote-access/config pm
+```
+
+This uses a ProxyJump through the gateway (`perlmutter.nersc.gov`) to reach `login03`. The connection uses SSH multiplexing (ControlMaster) so subsequent connections reuse the same tunnel.
+
+Available hosts:
+- `pm` or `perlmutter` — login node (via gateway)
+- `pm-gw` — gateway only (rarely needed directly)
+
+Run remote commands:
+```bash
+ssh -F /workspace/extra/remote-access/config pm "squeue -u lingzhi"
+```
 
 ---
 

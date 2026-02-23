@@ -1,22 +1,29 @@
+import { execSync } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
   ASSISTANT_NAME,
   DATA_DIR,
+  GROUPS_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_ONLY,
   TRIGGER_PATTERN,
 } from './config.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
+import { TelegramChannel } from './channels/telegram.js';
+import { cleanupOrphans, ensureContainerRuntimeRunning } from './container-runtime.js';
 import {
   ContainerOutput,
   runContainerAgent,
+  syncSharedSkills,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
-import { cleanupOrphans, ensureContainerRuntimeRunning } from './container-runtime.js';
 import {
   getAllChats,
   getAllRegisteredGroups,
@@ -123,10 +130,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (!group) return true;
 
   const channel = findChannel(channels, chatJid);
-  if (!channel) {
-    console.log(`Warning: no channel owns JID ${chatJid}, skipping messages`);
-    return true;
-  }
+  if (!channel) return true;
 
   const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
 
@@ -169,10 +173,49 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   await channel.setTyping?.(chatJid, true);
+  let typingInterval: ReturnType<typeof setInterval> | null = setInterval(() => {
+    channel.setTyping?.(chatJid, true).catch(() => {});
+  }, 4000);
   let hadError = false;
   let outputSentToUser = false;
 
+  const stopTyping = () => {
+    if (typingInterval) {
+      clearInterval(typingInterval);
+      typingInterval = null;
+      channel.setTyping?.(chatJid, false).catch(() => {});
+    }
+  };
+
   const output = await runAgent(group, prompt, chatJid, async (result) => {
+    // Forward activity events to user as real-time status
+    if (result.activity) {
+      const a = result.activity;
+      let activityText: string | null = null;
+      switch (a.type) {
+        case 'thinking':
+          activityText = `💭 ${a.text}`;
+          break;
+        case 'tool_use':
+          activityText = a.input ? `🔧 ${a.tool}: ${a.input}` : `🔧 ${a.tool}`;
+          break;
+        case 'text':
+          activityText = `💬 ${a.text}`;
+          break;
+        case 'tool_result':
+          // Raw tool output — not forwarded to user (verbose JSON, causes Telegram flooding)
+          break;
+        case 'tool_use_summary':
+          activityText = `📋 ${a.text}`;
+          break;
+      }
+      if (activityText) {
+        stopTyping();
+        await channel.sendMessage(chatJid, activityText);
+      }
+      return;
+    }
+
     // Streaming output callback — called for each agent result
     if (result.result) {
       const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
@@ -180,6 +223,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
+        stopTyping();
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
       }
@@ -187,16 +231,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       resetIdleTimer();
     }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
-
     if (result.status === 'error') {
       hadError = true;
     }
   });
 
-  await channel.setTyping?.(chatJid, false);
+  stopTyping();
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -332,10 +372,7 @@ async function startMessageLoop(): Promise<void> {
           if (!group) continue;
 
           const channel = findChannel(channels, chatJid);
-          if (!channel) {
-            console.log(`Warning: no channel owns JID ${chatJid}, skipping messages`);
-            continue;
-          }
+          if (!channel) continue;
 
           const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
           const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
@@ -370,9 +407,7 @@ async function startMessageLoop(): Promise<void> {
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
             // Show typing indicator while the container processes the piped message
-            channel.setTyping?.(chatJid, true)?.catch((err) =>
-              logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-            );
+            channel.setTyping?.(chatJid, true);
           } else {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -409,8 +444,37 @@ function ensureContainerSystemRunning(): void {
   cleanupOrphans();
 }
 
+/**
+ * Clear stale IPC input files left over from a previous service run.
+ * Any .json or _close files in data/ipc/*\/input/ belong to containers
+ * that are no longer running. Removing them prevents new containers from
+ * processing stale messages — the DB cursor + recoverPendingMessages()
+ * handles re-delivery from the database instead.
+ */
+function clearStaleIpcInputs(): void {
+  const ipcRoot = path.join(DATA_DIR, 'ipc');
+  if (!fs.existsSync(ipcRoot)) return;
+  let cleared = 0;
+  for (const groupFolder of fs.readdirSync(ipcRoot)) {
+    const inputDir = path.join(ipcRoot, groupFolder, 'input');
+    if (!fs.existsSync(inputDir)) continue;
+    for (const file of fs.readdirSync(inputDir)) {
+      if (file.endsWith('.json') || file === '_close') {
+        try {
+          fs.rmSync(path.join(inputDir, file));
+          cleared++;
+        } catch { /* ignore */ }
+      }
+    }
+  }
+  if (cleared > 0) {
+    logger.info({ cleared }, 'Cleared stale IPC input files from previous run');
+  }
+}
+
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
+  syncSharedSkills();
   initDatabase();
   logger.info('Database initialized');
   loadState();
@@ -434,9 +498,68 @@ async function main(): Promise<void> {
   };
 
   // Create and connect channels
-  whatsapp = new WhatsAppChannel(channelOpts);
-  channels.push(whatsapp);
-  await whatsapp.connect();
+  if (!TELEGRAM_ONLY) {
+    whatsapp = new WhatsAppChannel(channelOpts);
+    channels.push(whatsapp);
+    await whatsapp.connect();
+  }
+
+  if (TELEGRAM_BOT_TOKEN) {
+    const telegram = new TelegramChannel(TELEGRAM_BOT_TOKEN, {
+      ...channelOpts,
+      onAutoRegisterTopic: (topicJid, parentJid, threadId) => {
+        if (registeredGroups[topicJid]) return;
+        const parent = registeredGroups[parentJid];
+        if (!parent) return;
+        registerGroup(topicJid, {
+          name: `${parent.name} (topic ${threadId})`,
+          folder: `${parent.folder}-t${threadId}`,
+          trigger: parent.trigger,
+          added_at: new Date().toISOString(),
+          containerConfig: parent.containerConfig,
+          requiresTrigger: false,
+        });
+        queue.enqueueMessageCheck(topicJid);
+      },
+      onMediaFile: async (chatJid, buffer, ext) => {
+        const group = registeredGroups[chatJid];
+        if (!group) throw new Error(`No group for ${chatJid}`);
+        const uploadsDir = path.join(GROUPS_DIR, group.folder, 'uploads');
+        fs.mkdirSync(uploadsDir, { recursive: true });
+        const filename = `photo_${Date.now()}.${ext}`;
+        fs.writeFileSync(path.join(uploadsDir, filename), buffer);
+        return `/workspace/group/uploads/${filename}`;
+      },
+      getSkills: () => {
+        const skillsDirs = [
+          path.join(process.cwd(), 'container', 'skills'),
+          path.join(os.homedir(), '.claude', 'skills'),
+        ];
+        const seen = new Set<string>();
+        const result: Array<{ name: string; description: string }> = [];
+        for (const skillsDir of skillsDirs) {
+          if (!fs.existsSync(skillsDir)) continue;
+          for (const entry of fs.readdirSync(skillsDir, { withFileTypes: true })) {
+            // Use statSync to follow symlinks (global skills are symlinked)
+            const entryPath = path.join(skillsDir, entry.name);
+            try { if (!fs.statSync(entryPath).isDirectory()) continue; } catch { continue; }
+            const skillFile = path.join(skillsDir, entry.name, 'SKILL.md');
+            if (!fs.existsSync(skillFile)) continue;
+            const content = fs.readFileSync(skillFile, 'utf8');
+            const nameMatch = content.match(/^name:\s*(.+)$/m);
+            const descMatch = content.match(/^description:\s*(.+)$/m);
+            const name = nameMatch?.[1]?.trim() ?? entry.name;
+            if (seen.has(name)) continue;
+            seen.add(name);
+            result.push({ name, description: descMatch?.[1]?.trim() ?? '' });
+          }
+        }
+        return result.sort((a, b) => a.name.localeCompare(b.name));
+      },
+    });
+    channels.push(telegram);
+    await telegram.connect();
+  }
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
@@ -446,10 +569,7 @@ async function main(): Promise<void> {
     onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
       const channel = findChannel(channels, jid);
-      if (!channel) {
-        console.log(`Warning: no channel owns JID ${jid}, cannot send message`);
-        return;
-      }
+      if (!channel) return;
       const text = formatOutbound(rawText);
       if (text) await channel.sendMessage(jid, text);
     },
@@ -467,11 +587,9 @@ async function main(): Promise<void> {
     writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
   });
   queue.setProcessMessagesFn(processGroupMessages);
+  clearStaleIpcInputs();
   recoverPendingMessages();
-  startMessageLoop().catch((err) => {
-    logger.fatal({ err }, 'Message loop crashed unexpectedly');
-    process.exit(1);
-  });
+  startMessageLoop();
 }
 
 // Guard: only run when executed directly, not when imported by tests

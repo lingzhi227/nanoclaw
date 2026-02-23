@@ -34,6 +34,12 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  activity?: {
+    type: 'thinking' | 'tool_use' | 'text' | 'tool_result' | 'tool_use_summary';
+    tool?: string;
+    input?: string;
+    text?: string;
+  };
 }
 
 interface SessionEntry {
@@ -390,6 +396,9 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
 
+  // Accumulator for streaming content blocks (thinking text, tool input JSON)
+  const blockAccum = new Map<number, { type: string; name?: string; text: string }>();
+
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
@@ -416,6 +425,7 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
+      model: 'claude-opus-4-6',
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
@@ -448,6 +458,8 @@ async function runQuery(
           },
         },
       },
+      includePartialMessages: true,
+      maxThinkingTokens: 10000,
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook()] }],
         PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
@@ -460,6 +472,88 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+    }
+
+    // --- Real-time streaming via partial messages (content_block_start/delta/stop) ---
+    if ((message as { type: string }).type === 'stream_event' && 'event' in message) {
+      const event = (message as { event: { type: string; index?: number; content_block?: { type: string; name?: string }; delta?: { type: string; thinking?: string; partial_json?: string; text?: string } } }).event;
+
+      if (event.type === 'content_block_start' && event.content_block) {
+        const idx = event.index ?? 0;
+        blockAccum.set(idx, { type: event.content_block.type, name: event.content_block.name, text: '' });
+        // Don't emit tool_use here — wait for content_block_stop when full input is known.
+        // This avoids a duplicate notification (start with no input, then stop with input).
+      }
+
+      if (event.type === 'content_block_delta' && event.delta) {
+        const idx = event.index ?? 0;
+        const accum = blockAccum.get(idx);
+        if (accum) {
+          if (event.delta.type === 'thinking_delta' && event.delta.thinking) {
+            accum.text += event.delta.thinking;
+          } else if (event.delta.type === 'input_json_delta' && event.delta.partial_json) {
+            accum.text += event.delta.partial_json;
+          } else if (event.delta.type === 'text_delta' && event.delta.text) {
+            accum.text += event.delta.text;
+          }
+        }
+      }
+
+      if (event.type === 'content_block_stop') {
+        const idx = event.index ?? 0;
+        const accum = blockAccum.get(idx);
+        if (accum?.type === 'thinking' && accum.text) {
+          writeOutput({
+            status: 'success',
+            result: null,
+            activity: { type: 'thinking', text: accum.text.slice(0, 2000) },
+          });
+        } else if (accum?.type === 'tool_use' && accum.text) {
+          // Extract a brief, human-readable description from the tool input JSON.
+          // Avoids sending raw JSON to users — just the most relevant field.
+          let brief: string | undefined;
+          try {
+            const inp = JSON.parse(accum.text) as Record<string, unknown>;
+            const s = (v: unknown) => typeof v === 'string' ? v.slice(0, 120) : undefined;
+            brief = s(inp.url) ?? s(inp.command) ?? s(inp.file_path) ?? s(inp.path)
+              ?? s(inp.query) ?? s(inp.pattern) ?? s(inp.prompt);
+          } catch { /* not valid JSON, skip */ }
+          writeOutput({
+            status: 'success',
+            result: null,
+            activity: { type: 'tool_use', tool: accum.name || 'unknown', input: brief },
+          });
+        } else if (accum?.type === 'text' && accum.text && blockAccum.size > 0) {
+          // Mid-turn text (tool calls follow in this message) — emit as activity
+          // Don't emit final-answer text; that arrives via 'result'
+        }
+        blockAccum.delete(idx);
+      }
+    }
+
+    // --- Tool result feedback (user messages with tool_use_result = tool outputs) ---
+    if (message.type === 'user') {
+      const userMsg = message as { tool_use_result?: unknown };
+      if (userMsg.tool_use_result !== undefined) {
+        const preview = typeof userMsg.tool_use_result === 'string'
+          ? userMsg.tool_use_result.slice(0, 500)
+          : JSON.stringify(userMsg.tool_use_result).slice(0, 500);
+        writeOutput({
+          status: 'success',
+          result: null,
+          activity: { type: 'tool_result', text: preview },
+        });
+      }
+    }
+
+    // --- Non-streaming event types ---
+    if ((message as { type: string }).type === 'tool_use_summary') {
+      const ts = message as { summary: string };
+      writeOutput({
+        status: 'success',
+        result: null,
+        activity: { type: 'tool_use_summary', text: ts.summary.slice(0, 1000) },
+      });
     }
 
     if (message.type === 'system' && message.subtype === 'init') {

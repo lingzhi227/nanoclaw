@@ -50,12 +50,44 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  activity?: {
+    type: 'thinking' | 'tool_use' | 'text' | 'tool_result' | 'tool_use_summary';
+    tool?: string;
+    input?: string;
+    text?: string;
+  };
 }
 
 interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+}
+
+const SHARED_SKILLS_DIR = path.join(DATA_DIR, 'shared-skills');
+
+export function syncSharedSkills(): void {
+  // Clean and recreate
+  fs.rmSync(SHARED_SKILLS_DIR, { recursive: true, force: true });
+  fs.mkdirSync(SHARED_SKILLS_DIR, { recursive: true });
+
+  // Same sources as before: project skills first, user skills override
+  const skillsSources = [
+    path.join(process.cwd(), 'container', 'skills'),
+    path.join(getHomeDir(), '.claude', 'skills'),
+  ];
+
+  for (const skillsSrc of skillsSources) {
+    if (!fs.existsSync(skillsSrc)) continue;
+    for (const skillDir of fs.readdirSync(skillsSrc)) {
+      const srcDir = path.join(skillsSrc, skillDir);
+      try { if (!fs.statSync(srcDir).isDirectory()) continue; } catch { continue; }
+      const dstDir = path.join(SHARED_SKILLS_DIR, skillDir);
+      fs.rmSync(dstDir, { recursive: true, force: true });
+      fs.cpSync(srcDir, dstDir, { recursive: true, dereference: true });
+      normalizeSkillPaths(dstDir);
+    }
+  }
 }
 
 function buildVolumeMounts(
@@ -126,22 +158,20 @@ function buildVolumeMounts(
     }, null, 2) + '\n');
   }
 
-  // Sync skills from container/skills/ into each group's .claude/skills/
-  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
-  const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
-    for (const skillDir of fs.readdirSync(skillsSrc)) {
-      const srcDir = path.join(skillsSrc, skillDir);
-      if (!fs.statSync(srcDir).isDirectory()) continue;
-      const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
-    }
-  }
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
     readonly: false,
   });
+
+  // Shared agent skills (read-only, overlays per-group .claude/skills/)
+  if (fs.existsSync(SHARED_SKILLS_DIR)) {
+    mounts.push({
+      hostPath: SHARED_SKILLS_DIR,
+      containerPath: '/home/node/.claude/skills',
+      readonly: true,
+    });
+  }
 
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
@@ -178,24 +208,76 @@ function buildVolumeMounts(
 }
 
 /**
+ * Normalize host-specific absolute paths in a copied skill directory so that
+ * skills written on the host work inside containers without modification.
+ * Replaces e.g. `/Users/alice/` with `~/` in all .md and .yaml files.
+ * Also fixes `.//` double-slash typos (e.g. `.//${homeDir}/`) → `./`.
+ */
+function normalizeSkillPaths(skillDstDir: string): void {
+  const homePrefix = getHomeDir() + '/';
+  walkFiles(skillDstDir, (filePath) => {
+    if (!/\.(md|yaml|yml|txt)$/.test(filePath)) return;
+    let content: string;
+    try { content = fs.readFileSync(filePath, 'utf-8'); } catch { return; }
+    const normalized = content
+      .split(homePrefix).join('~/')
+      .replace(/\.\/{2,}/g, './');
+    if (normalized !== content) {
+      try { fs.writeFileSync(filePath, normalized, 'utf-8'); } catch { /* best effort */ }
+    }
+  });
+}
+
+function walkFiles(dir: string, callback: (filePath: string) => void): void {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) walkFiles(full, callback);
+    else if (entry.isFile()) callback(full);
+  }
+}
+
+/**
+ * Read the dynamic agent-env whitelist from .claude/agent-env.json.
+ * This file lists extra env var names (beyond the hardcoded set) to pass
+ * to containers. The install-agent-skills skill populates this file.
+ */
+function readAgentEnvKeys(): string[] {
+  const agentEnvPath = path.join(process.cwd(), '.claude', 'agent-env.json');
+  try {
+    const data = JSON.parse(fs.readFileSync(agentEnvPath, 'utf-8')) as unknown;
+    if (Array.isArray(data)) return (data as unknown[]).filter(k => typeof k === 'string') as string[];
+  } catch { /* file missing or malformed — use defaults only */ }
+  return [];
+}
+
+/**
  * Read allowed secrets from .env for passing to the container via stdin.
  * Secrets are never written to disk or mounted as files.
+ * Always includes the core auth keys; additional keys come from .claude/agent-env.json.
  */
 function readSecrets(): Record<string, string> {
-  return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
+  const coreKeys = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'S2_API_KEY'];
+  const extraKeys = readAgentEnvKeys();
+  const allKeys = [...new Set([...coreKeys, ...extraKeys])];
+  return readEnvFile(allKeys);
 }
 
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
-  // Run as host user so bind-mounted files are accessible.
+  // Run as host user so bind-mounted files are accessible on Linux native Docker.
+  // On macOS/Windows, Docker Desktop uses grpcfuse/VirtioFS for bind mounts and handles
+  // ownership translation itself — passing --user activates the fakeowner OOT kernel module
+  // which has a bug in generic_shutdown_super (linuxkit 6.12.x) and causes VM kernel panics.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
   // or when getuid is unavailable (native Windows without WSL).
-  const hostUid = process.getuid?.();
-  const hostGid = process.getgid?.();
-  if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
-    args.push('--user', `${hostUid}:${hostGid}`);
-    args.push('-e', 'HOME=/home/node');
+  if (process.platform === 'linux') {
+    const hostUid = process.getuid?.();
+    const hostGid = process.getgid?.();
+    if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
+      args.push('--user', `${hostUid}:${hostGid}`);
+      args.push('-e', 'HOME=/home/node');
+    }
   }
 
   for (const mount of mounts) {

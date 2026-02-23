@@ -1,0 +1,370 @@
+import { Bot, GrammyError } from 'grammy';
+
+import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { logger } from '../logger.js';
+import {
+  Channel,
+  OnChatMetadata,
+  OnInboundMessage,
+  RegisteredGroup,
+} from '../types.js';
+
+function buildTgJid(chatId: number, threadId?: number): string {
+  return threadId !== undefined ? `tg:${chatId}:${threadId}` : `tg:${chatId}`;
+}
+
+export function parseTgJid(jid: string): { chatId: string; threadId?: number } {
+  const parts = jid.replace(/^tg:/, '').split(':');
+  return { chatId: parts[0], threadId: parts[1] !== undefined ? Number(parts[1]) : undefined };
+}
+
+export interface TelegramChannelOpts {
+  onMessage: OnInboundMessage;
+  onChatMetadata: OnChatMetadata;
+  registeredGroups: () => Record<string, RegisteredGroup>;
+  onAutoRegisterTopic?: (topicJid: string, parentJid: string, threadId: number) => void;
+  /** Download an image and save it to the group folder. Returns the container-side path. */
+  onMediaFile?: (chatJid: string, buffer: Buffer, ext: string) => Promise<string>;
+  /** Returns list of available skills for the /skills command. */
+  getSkills?: () => Array<{ name: string; description: string }>;
+}
+
+/**
+ * Bot commands handled natively or that are Telegram system commands.
+ * These are NOT forwarded to the agent.
+ * Skill commands (/skill-name args) are forwarded to the agent.
+ */
+const BUILT_IN_COMMANDS = new Set(['chatid', 'ping', 'skills', 'start', 'help', 'settings']);
+
+export class TelegramChannel implements Channel {
+  name = 'telegram';
+
+  private bot: Bot | null = null;
+  private opts: TelegramChannelOpts;
+  private botToken: string;
+
+  constructor(botToken: string, opts: TelegramChannelOpts) {
+    this.botToken = botToken;
+    this.opts = opts;
+  }
+
+  async connect(): Promise<void> {
+    this.bot = new Bot(this.botToken);
+
+    // Command to get chat ID (useful for registration)
+    this.bot.command('chatid', (ctx) => {
+      const chatId = ctx.chat.id;
+      const chatType = ctx.chat.type;
+      const threadId = (ctx.message as any)?.message_thread_id as number | undefined;
+      const chatName =
+        chatType === 'private'
+          ? ctx.from?.first_name || 'Private'
+          : (ctx.chat as any).title || 'Unknown';
+
+      let reply = `Chat ID: \`tg:${chatId}\`\nName: ${chatName}\nType: ${chatType}`;
+      if (threadId !== undefined) {
+        reply += `\nTopic ID: ${threadId}\nTopic JID: \`tg:${chatId}:${threadId}\``;
+      }
+      ctx.reply(reply, { parse_mode: 'Markdown' });
+    });
+
+    // Command to check bot status
+    this.bot.command('ping', (ctx) => {
+      ctx.reply(`${ASSISTANT_NAME} is online.`);
+    });
+
+    // Command to list available skills
+    this.bot.command('skills', async (ctx) => {
+      const skills = this.opts.getSkills?.() ?? [];
+      if (skills.length === 0) {
+        await ctx.reply('No skills available.');
+        return;
+      }
+      const lines = skills.map((s) => `/${s.name} — ${s.description}`);
+      const header = `Available skills (${skills.length}):\n\n`;
+      const MAX = 4096;
+      let chunk = header;
+      for (const line of lines) {
+        if ((chunk + line + '\n').length > MAX) {
+          await ctx.reply(chunk.trimEnd());
+          chunk = '';
+        }
+        chunk += line + '\n';
+      }
+      if (chunk.trim()) await ctx.reply(chunk.trimEnd());
+    });
+
+    this.bot.on('message:text', async (ctx) => {
+      // Skip built-in bot commands — skill commands (/skill-name args) are forwarded to the agent
+      const cmdMatch = ctx.message.text.match(/^\/(\w+)/);
+      if (cmdMatch && BUILT_IN_COMMANDS.has(cmdMatch[1].toLowerCase())) return;
+
+      const threadId = ctx.message.message_thread_id;
+      const chatJid = buildTgJid(ctx.chat.id, threadId);
+      let content = ctx.message.text;
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id.toString() ||
+        'Unknown';
+      const sender = ctx.from?.id.toString() || '';
+      const msgId = ctx.message.message_id.toString();
+
+      // Determine chat name
+      const chatName =
+        ctx.chat.type === 'private'
+          ? senderName
+          : (ctx.chat as any).title || chatJid;
+
+      // Translate Telegram @bot_username mentions into TRIGGER_PATTERN format.
+      // Telegram @mentions (e.g., @andy_ai_bot) won't match TRIGGER_PATTERN
+      // (e.g., ^@Andy\b), so we prepend the trigger when the bot is @mentioned.
+      const botUsername = ctx.me?.username?.toLowerCase();
+      if (botUsername) {
+        const entities = ctx.message.entities || [];
+        const isBotMentioned = entities.some((entity) => {
+          if (entity.type === 'mention') {
+            const mentionText = content
+              .substring(entity.offset, entity.offset + entity.length)
+              .toLowerCase();
+            return mentionText === `@${botUsername}`;
+          }
+          return false;
+        });
+        if (isBotMentioned && !TRIGGER_PATTERN.test(content)) {
+          content = `@${ASSISTANT_NAME} ${content}`;
+        }
+      }
+
+      // Store chat metadata for discovery
+      this.opts.onChatMetadata(chatJid, timestamp, chatName);
+
+      // Only deliver full message for registered groups
+      let group = this.opts.registeredGroups()[chatJid];
+      if (!group && threadId !== undefined && this.opts.onAutoRegisterTopic) {
+        const parentJid = `tg:${ctx.chat.id}`;
+        if (this.opts.registeredGroups()[parentJid]) {
+          this.opts.onAutoRegisterTopic(chatJid, parentJid, threadId);
+          group = this.opts.registeredGroups()[chatJid];
+        }
+      }
+      if (!group) {
+        logger.debug(
+          { chatJid, chatName },
+          'Message from unregistered Telegram chat',
+        );
+        return;
+      }
+
+      // Deliver message — startMessageLoop() will pick it up
+      this.opts.onMessage(chatJid, {
+        id: msgId,
+        chat_jid: chatJid,
+        sender,
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+
+      logger.info(
+        { chatJid, chatName, sender: senderName },
+        'Telegram message stored',
+      );
+    });
+
+    // Handle non-text messages with placeholders so the agent knows something was sent
+    const storeNonText = (ctx: any, placeholder: string) => {
+      const threadId = ctx.message?.message_thread_id as number | undefined;
+      const chatJid = buildTgJid(ctx.chat.id, threadId);
+      let group = this.opts.registeredGroups()[chatJid];
+      if (!group && threadId !== undefined && this.opts.onAutoRegisterTopic) {
+        const parentJid = `tg:${ctx.chat.id}`;
+        if (this.opts.registeredGroups()[parentJid]) {
+          this.opts.onAutoRegisterTopic(chatJid, parentJid, threadId);
+          group = this.opts.registeredGroups()[chatJid];
+        }
+      }
+      if (!group) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+
+      this.opts.onChatMetadata(chatJid, timestamp);
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content: `${placeholder}${caption}`,
+        timestamp,
+        is_from_me: false,
+      });
+    };
+
+    this.bot.on('message:photo', async (ctx) => {
+      // Try to download and save the image for vision analysis
+      if (this.opts.onMediaFile) {
+        const threadId = ctx.message?.message_thread_id as number | undefined;
+        const chatJid = buildTgJid(ctx.chat.id, threadId);
+        let group = this.opts.registeredGroups()[chatJid];
+        if (!group && threadId !== undefined && this.opts.onAutoRegisterTopic) {
+          const parentJid = `tg:${ctx.chat.id}`;
+          if (this.opts.registeredGroups()[parentJid]) {
+            this.opts.onAutoRegisterTopic(chatJid, parentJid, threadId);
+            group = this.opts.registeredGroups()[chatJid];
+          }
+        }
+        if (group) {
+          const largest = ctx.message.photo[ctx.message.photo.length - 1];
+          const caption = ctx.message.caption ? `\nCaption: ${ctx.message.caption}` : '';
+          const timestamp = new Date(ctx.message.date * 1000).toISOString();
+          const senderName = ctx.from?.first_name || ctx.from?.username || ctx.from?.id?.toString() || 'Unknown';
+          let content: string;
+          try {
+            const file = await this.bot!.api.getFile(largest.file_id);
+            const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+            const resp = await fetch(url);
+            const buffer = Buffer.from(await resp.arrayBuffer());
+            const ext = file.file_path?.split('.').pop() || 'jpg';
+            const containerPath = await this.opts.onMediaFile(chatJid, buffer, ext);
+            content = `[Photo: ${containerPath}]${caption}`;
+            logger.info({ chatJid, containerPath }, 'Telegram photo saved for vision');
+          } catch (err) {
+            logger.warn({ chatJid, err }, 'Failed to download Telegram photo, using placeholder');
+            content = `[Photo]${caption}`;
+          }
+          this.opts.onChatMetadata(chatJid, timestamp);
+          this.opts.onMessage(chatJid, {
+            id: ctx.message.message_id.toString(),
+            chat_jid: chatJid,
+            sender: ctx.from?.id?.toString() || '',
+            sender_name: senderName,
+            content,
+            timestamp,
+            is_from_me: false,
+          });
+          return;
+        }
+      }
+      storeNonText(ctx, '[Photo]');
+    });
+    this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
+    this.bot.on('message:voice', (ctx) =>
+      storeNonText(ctx, '[Voice message]'),
+    );
+    this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
+    this.bot.on('message:document', (ctx) => {
+      const name = ctx.message.document?.file_name || 'file';
+      storeNonText(ctx, `[Document: ${name}]`);
+    });
+    this.bot.on('message:sticker', (ctx) => {
+      const emoji = ctx.message.sticker?.emoji || '';
+      storeNonText(ctx, `[Sticker ${emoji}]`);
+    });
+    this.bot.on('message:location', (ctx) => storeNonText(ctx, '[Location]'));
+    this.bot.on('message:contact', (ctx) => storeNonText(ctx, '[Contact]'));
+
+    // Handle errors gracefully
+    this.bot.catch((err) => {
+      logger.error({ err: err.message }, 'Telegram bot error');
+    });
+
+    // Start polling — returns a Promise that resolves when started
+    return new Promise<void>((resolve) => {
+      this.bot!.start({
+        onStart: (botInfo) => {
+          logger.info(
+            { username: botInfo.username, id: botInfo.id },
+            'Telegram bot connected',
+          );
+          console.log(`\n  Telegram bot: @${botInfo.username}`);
+          console.log(
+            `  Send /chatid to the bot to get a chat's registration ID\n`,
+          );
+          resolve();
+        },
+      });
+    });
+  }
+
+  async sendMessage(jid: string, text: string): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return;
+    }
+
+    try {
+      const { chatId, threadId } = parseTgJid(jid);
+      const opts = threadId !== undefined ? { message_thread_id: threadId } : undefined;
+
+      // Telegram has a 4096 character limit per message — split if needed
+      const MAX_LENGTH = 4096;
+      const chunks = text.length <= MAX_LENGTH
+        ? [text]
+        : Array.from({ length: Math.ceil(text.length / MAX_LENGTH) }, (_, i) =>
+            text.slice(i * MAX_LENGTH, (i + 1) * MAX_LENGTH));
+      for (const chunk of chunks) {
+        await this.sendChunk(chatId, chunk, opts);
+      }
+      logger.info({ jid, length: text.length }, 'Telegram message sent');
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send Telegram message');
+    }
+  }
+
+  /** Send a single chunk with automatic 429 retry (one retry after the specified delay). */
+  private async sendChunk(
+    chatId: string,
+    text: string,
+    opts: Record<string, unknown> | undefined,
+  ): Promise<void> {
+    const bot = this.bot!;
+    const send = () => bot.api.sendMessage(chatId, text, opts as Parameters<typeof bot.api.sendMessage>[2]);
+    try {
+      await send();
+    } catch (err) {
+      if (err instanceof GrammyError && err.error_code === 429) {
+        const retryAfter = (err.parameters?.retry_after ?? 30) + 1;
+        logger.warn({ chatId, retryAfter }, 'Telegram 429 — retrying after delay');
+        await new Promise((r) => setTimeout(r, retryAfter * 1000));
+        await send();
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  isConnected(): boolean {
+    return this.bot !== null;
+  }
+
+  ownsJid(jid: string): boolean {
+    return jid.startsWith('tg:');
+  }
+
+  async disconnect(): Promise<void> {
+    if (this.bot) {
+      this.bot.stop();
+      this.bot = null;
+      logger.info('Telegram bot stopped');
+    }
+  }
+
+  async setTyping(jid: string, isTyping: boolean): Promise<void> {
+    if (!this.bot || !isTyping) return;
+    try {
+      const { chatId, threadId } = parseTgJid(jid);
+      const opts = threadId !== undefined ? { message_thread_id: threadId } : undefined;
+      await this.bot.api.sendChatAction(chatId, 'typing', opts);
+    } catch (err) {
+      logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
+    }
+  }
+}
